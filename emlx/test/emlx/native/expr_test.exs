@@ -4441,6 +4441,7 @@ defmodule EMLX.Native.ExprTest do
     Enum.zip(Nx.to_flat_list(a), Nx.to_flat_list(b))
     |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol) end)
   end
+
   describe "non-contiguous runtime_call arguments" do
     # nbytes() is the logical size, so copying that many bytes out of a
     # stride-0 array's buffer used to read past the end: the callback saw the
