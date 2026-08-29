@@ -436,6 +436,64 @@ defmodule EMLX do
   ## Quantization operations (for 4-bit model support)
 
   @doc """
+  Quantized matmul with per-row expert selection (`mx::gather_qmm`).
+
+  Same contract as `quantized_matmul/8`, plus two index tensors. `w` carries
+  every expert stacked on a leading axis; `rhs_indices` picks the expert for
+  each row of `x`, and `lhs_indices` picks the row of `x` (pass `nil` to take
+  them in order). Set `sorted_indices` when `rhs_indices` is already sorted —
+  the kernel then skips its own sort.
+
+  This is what a mixture-of-experts layer needs: the gather happens inside the
+  kernel, so no per-token copy of the expert weights is ever materialised.
+  """
+  @mlx_function {:gather_qmm, 13}
+  def gather_qmm(
+        {dev_x, ref_x} = _tensor_x,
+        {dev_w, ref_w} = _tensor_w,
+        {dev_s, ref_s} = _tensor_scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        transpose \\ true,
+        group_size \\ 64,
+        bits \\ 4,
+        mode \\ "affine",
+        sorted_indices \\ false
+      )
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
+    {ref_b, biases_device} = unwrap_optional_tensor(biases)
+    {ref_lhs, lhs_device} = unwrap_optional_tensor(lhs_indices)
+    {ref_rhs, rhs_device} = unwrap_optional_tensor(rhs_indices)
+
+    device =
+      [dev_x, dev_w, dev_s, biases_device, lhs_device, rhs_device]
+      |> Enum.reduce(&merge_device(&2, &1))
+
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.gather_qmm(
+        worker,
+        ref_x,
+        ref_w,
+        ref_s,
+        ref_b,
+        ref_lhs,
+        ref_rhs,
+        transpose,
+        group_size,
+        bits,
+        mode,
+        sorted_indices,
+        effective_device
+      )
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Performs quantized matrix multiplication.
 
   This is the key operation for efficient 4-bit inference. It multiplies `x` with
@@ -1192,7 +1250,11 @@ defmodule EMLX do
   end
 
   @doc """
-  Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
+  Quantize a dense `Nx.Tensor` of rank 2 or higher and return an annotated
+  quantized tensor.
+
+  Quantization runs along the last axis. Leading axes are batch or stacking
+  dimensions.
 
   The returned tensor carries the original logical shape and type (e.g.
   `{:s, 4}`). Its backend stores the packed uint32 data and a
@@ -1219,12 +1281,12 @@ defmodule EMLX do
     validate_quantization_mode!(mode)
     validate_microscaled_constraints!(mode, group_size, bits)
 
-    unless Nx.rank(tensor) == 2 do
+    unless Nx.rank(tensor) >= 2 do
       raise ArgumentError,
-            "EMLX.quantize/2 requires a rank-2 tensor, got rank #{Nx.rank(tensor)}"
+            "EMLX.quantize/2 requires a tensor of rank 2 or higher, got rank #{Nx.rank(tensor)}"
     end
 
-    {_out_features, in_features} = Nx.shape(tensor)
+    in_features = Nx.axis_size(tensor, -1)
 
     unless rem(in_features, group_size) == 0 do
       raise ArgumentError,
@@ -1316,6 +1378,57 @@ defmodule EMLX do
         cfg.group_size,
         cfg.bits,
         cfg.mode
+      )
+
+    EMLX.Backend.to_nx(result)
+  end
+
+  @doc """
+  Run `gather_qmm` at the `Nx.Tensor` level: pick an expert per row, then
+  multiply.
+
+  `qw` must be a quantized tensor produced by `EMLX.quantize/2` whose leading
+  axis stacks the experts. `rhs_indices` names the expert for each row; pass
+  `lhs_indices` to reorder the activation rows as well, or `nil` to take them
+  in order. Set `:sorted_indices` when `rhs_indices` is already sorted so the
+  kernel can skip its own sort.
+  """
+  def gather_quantized_matmul(
+        %Nx.Tensor{} = activation,
+        %Nx.Tensor{} = qw,
+        %Nx.Tensor{} = rhs_indices,
+        opts \\ []
+      ) do
+    opts = Keyword.validate!(opts, lhs_indices: nil, sorted_indices: false)
+    cfg = qw.data.quantization_config
+
+    if is_nil(cfg) do
+      raise ArgumentError,
+            "EMLX.gather_quantized_matmul/4: second argument must be a quantized tensor"
+    end
+
+    if not is_nil(activation.data.quantization_config) do
+      raise ArgumentError,
+            "EMLX.gather_quantized_matmul/4 requires a dense activation as the " <>
+              "first argument; got two quantized tensors. Dequantize one of them first."
+    end
+
+    lhs_ref = opts[:lhs_indices] && EMLX.Backend.from_nx(opts[:lhs_indices])
+    biases_ref = cfg.biases && EMLX.Backend.from_nx(cfg.biases)
+
+    result =
+      EMLX.gather_qmm(
+        EMLX.Backend.from_nx(activation),
+        qw.data.ref,
+        EMLX.Backend.from_nx(cfg.scales),
+        biases_ref,
+        lhs_ref,
+        EMLX.Backend.from_nx(rhs_indices),
+        true,
+        cfg.group_size,
+        cfg.bits,
+        cfg.mode,
+        opts[:sorted_indices]
       )
 
     EMLX.Backend.to_nx(result)
@@ -1738,46 +1851,57 @@ defmodule EMLX do
 
   @behaviour Nx.Defn.Compiler
 
-  # Known EMLX-specific compiler opts. `:command_queue` is injected by
-  # `__partitions_options__/1` but may also be passed directly by callers
-  # that manage their own queues (equivalent to a manual `with_queue`).
   @valid_compiler_keys [:device, :max_concurrency, :command_queue, :hooks]
 
-  # Process-lifetime dispatch cache backing `dispatch_key/3` +
-  # `get_or_compile_program/6` (see their docs) — a compiled program is keyed
-  # by a *structural* signature of its `Expr` (not object identity), so
-  # it survives across `Nx.Defn.Graph.run/3`'s per-call re-tracing and is
-  # shared across structurally-identical call sites (e.g. every one of
-  # Qwen3's 28 attention layers), not just within one closure's lifetime.
+  # Structural program cache for `get_or_compile_program/6`.
   @native_dispatch_cache_table :emlx_native_dispatch_cache
 
-  # A second, process-lifetime cache in front of `dispatch_key/3`'s own
-  # (expensive — O(nodes), plus per-opaque-scope SHA256 hashing) structural
-  # walk, keyed by `output_expr`'s own node identity rather than its
-  # structural signature. This matters for `run_while_loop/3`'s host-driven
-  # `cond_fn`/`body_fn`: `Nx.Defn.jit/2` retraces `fn _ -> body_expr end`
-  # once and caches *that* trace by argument template, so every subsequent
-  # call re-enters `__jit__`/`build_eval_fn` with the *exact same* `Expr`
-  # (identical ids, not just structurally identical) — walking it again on
-  # every decode step is pure waste. (This is unlike `Nx.Defn.Graph.run/3`'s
-  # per-stage re-tracing, which *does* mint fresh ids each call — hence
-  # `dispatch_key/3` still has to fall back to the structural walk on a miss.)
+  # Expr-id cache in front of `dispatch_key/3`.
   @dispatch_key_by_id_table :emlx_dispatch_key_by_id
+
+  # `native_compile/3` closures. Created by `init/0`.
+  @compile_closure_table :emlx_compile_closures
+
+  @doc false
+  def init do
+    case :ets.whereis(@compile_closure_table) do
+      :undefined ->
+        :ets.new(@compile_closure_table, [
+          :named_table,
+          :public,
+          :set,
+          read_concurrency: true,
+          write_concurrency: true
+        ])
+
+      _ ->
+        :ok
+    end
+  end
 
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
     __compile__(key, vars, fun, opts).(args_list)
   end
 
+  defp compile_cache_key(key, vars, hooks, device) do
+    templates =
+      Enum.map(vars, fn var -> Nx.Defn.Composite.traverse(var, &Nx.to_template/1) end)
+
+    {key, templates, hooks, device}
+  end
+
   @impl Nx.Defn.Compiler
-  def __compile__(_key, vars, fun, opts) do
+  def __compile__(key, vars, fun, opts) do
     Keyword.validate!(opts, @valid_compiler_keys)
 
-    case Keyword.get(opts, :hooks, %{}) do
+    hooks = Keyword.get(opts, :hooks, %{})
+
+    case hooks do
       empty when empty == %{} ->
         :ok
 
-      hooks ->
+      _ ->
         raise ArgumentError,
               "EMLX does not support the :hooks named-override map (got callbacks for " <>
                 "#{inspect(Map.keys(hooks))}) — :hook/:io_call expr nodes lower natively " <>
@@ -1788,7 +1912,20 @@ defmodule EMLX do
     queue = Keyword.get(opts, :command_queue)
     device = Keyword.get(opts, :device, default_device())
 
-    wrap_with_queue(queue, native_compile(vars, fun, device))
+    cache_key = compile_cache_key(key, vars, hooks, device)
+
+    eval_fn =
+      case :ets.lookup(@compile_closure_table, cache_key) do
+        [{^cache_key, cached}] ->
+          cached
+
+        [] ->
+          built = native_compile(vars, fun, device)
+          :ets.insert(@compile_closure_table, {cache_key, built})
+          built
+      end
+
+    wrap_with_queue(queue, eval_fn)
   end
 
   # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a
