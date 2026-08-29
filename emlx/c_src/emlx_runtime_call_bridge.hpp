@@ -166,12 +166,9 @@ inline void invoke_runtime_call(int64_t callback_index,
           "emlx::native: failed to allocate binary for runtime_call arg");
     }
     if (nbytes > 0) {
-      // nbytes() is the logical size, but a non-contiguous array — anything
-      // broadcast, transposed or sliced — holds fewer elements than that in
-      // its buffer, so copying nbytes straight out of data() reads past the
-      // end and leaves the callback with only the first element intact.
-      // Materialise a row-major copy first, the same fallback to_blob_term
-      // uses.
+      // Non-contiguous arrays (broadcast/transposed/sliced) hold fewer
+      // bytes than nbytes() in their buffer; materialise a contiguous copy
+      // first, same as to_blob_term's fallback.
       if (in.flags().row_contiguous) {
         std::memcpy(bin.data, in.data<uint8_t>(), nbytes);
       } else {
