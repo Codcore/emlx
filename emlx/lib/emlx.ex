@@ -1250,7 +1250,11 @@ defmodule EMLX do
   end
 
   @doc """
-  Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
+  Quantize a dense `Nx.Tensor` of rank 2 or higher and return an annotated
+  quantized tensor.
+
+  Quantization runs along the last axis. Leading axes are batch or stacking
+  dimensions.
 
   The returned tensor carries the original logical shape and type (e.g.
   `{:s, 4}`). Its backend stores the packed uint32 data and a
@@ -1277,12 +1281,12 @@ defmodule EMLX do
     validate_quantization_mode!(mode)
     validate_microscaled_constraints!(mode, group_size, bits)
 
-    unless Nx.rank(tensor) == 2 do
+    unless Nx.rank(tensor) >= 2 do
       raise ArgumentError,
-            "EMLX.quantize/2 requires a rank-2 tensor, got rank #{Nx.rank(tensor)}"
+            "EMLX.quantize/2 requires a tensor of rank 2 or higher, got rank #{Nx.rank(tensor)}"
     end
 
-    {_out_features, in_features} = Nx.shape(tensor)
+    in_features = Nx.axis_size(tensor, -1)
 
     unless rem(in_features, group_size) == 0 do
       raise ArgumentError,

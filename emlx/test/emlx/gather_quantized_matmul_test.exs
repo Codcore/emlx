@@ -8,26 +8,11 @@ defmodule EMLX.GatherQuantizedMatmulTest do
 
   @moduletag :metal
 
-  # One weight matrix per expert, packed the way a checkpoint delivers them:
-  # `EMLX.quantize/2` takes a single matrix, so the stack goes through the
-  # device-level call and `quantized_tensor/5`, which is what that function is
-  # documented for.
   defp stacked_experts(count, out, inp) do
-    dense =
-      Nx.iota({count, out, inp}, type: :f32)
-      |> Nx.divide(count * out * inp)
-      |> Nx.subtract(0.5)
-      |> EMLX.Backend.from_nx()
-
-    {weight_ref, scales_ref, biases_ref} = EMLX.quantize(dense, 64, 4)
-
-    EMLX.Quantization.quantized_tensor(
-      weight_ref,
-      scales_ref,
-      biases_ref,
-      {count, out, inp},
-      group_size: 64
-    )
+    Nx.iota({count, out, inp}, type: :f32)
+    |> Nx.divide(count * out * inp)
+    |> Nx.subtract(0.5)
+    |> EMLX.quantize([])
   end
 
   # Each row multiplied by its own expert, spelled out with dense matmuls.

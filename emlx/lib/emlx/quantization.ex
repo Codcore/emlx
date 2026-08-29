@@ -61,7 +61,10 @@ defmodule EMLX.Quantization do
   alias EMLX.Quantization.Config
 
   @doc """
-  Quantize a dense 2-D tensor via `Nx.runtime_call`.
+  Quantize a dense tensor of rank 2 or higher via `Nx.runtime_call`.
+
+  Quantization runs along the last axis; leading axes are batch or stacking
+  dims.
 
   At execution time the callback receives the real tensor and runs
   `mx::quantize`. Returns an annotated quantized `Nx.Tensor` with the same
